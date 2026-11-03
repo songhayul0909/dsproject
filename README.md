@@ -8,7 +8,7 @@
 - 20716 송하율: 제로 칼로리 음료수는 당류가 아예 없다고 생각해서 제로 칼로리 음료수가 건강상 이점이 있다고 생각했다.실제 내 생각이 맞는지 데이터로 확인해보고싶다.
 ## 데이터
 - 출처: 식품의약품안전처 영양성분https://various.foodsafetykorea.go.kr/nutrient/general/food/firstList.do?searchText=%EC%A0%9C%EB%A1%9C&searchMonth=10&searchProcCode=LOG_IDX&searchLogType=main&firstYn=N
-
+https://jamanetwork.com/journals/jamanetworkopen/fullarticle/2790045?utm_source=chatgpt.com
 - 기간·행 수·열 수: 2023-06-30 ~ 2025-09-30 · 46행 · 15열.음료수가 아닌 제로 티라미수 1개를 빼고 총 45개를 분석함.
 - 사용한 열: 번호,식품코드, 식품명, 음료종류, 기준단위, 식품중량과 중량단위, 에너지_kcal, 단백질_g, 지방_g, 탄수화물_g, 당류_g, 나트륨_mg, 포화지방_g, 데이터생성일.
 - 개인 단위 정보 없음 확인: 행마다 제품 하나이고 공개된 영양성분 정보이며, 연락처나 사생활 정보는 없습니다.
