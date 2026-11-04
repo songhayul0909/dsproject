@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -25,6 +27,8 @@ COMP_KO = {
 GROUP_KO = {"SSB": "설탕음료", "Water": "물", "LNCSB": "제로음료"}
 COMP_COLORS = ["#2CA02C", "#4C78A8", "#F58518"]
 BETTER, NEUTRAL, WORSE = "#8FD18F", "#E3E3E3", "#F4A6A6"
+# 제거할 당화혈색소 이상치 (지표, 연구) — 다른 이상치는 그대로 둠
+HBA1C_METRIC, HBA1C_OUTLIER_STUDY = "HbA1c", "Madjd 2017"
 FLAG_COLOR = {"정상": "#5B8DB8", "주의": "#F58518", "이상치": "#D62728"}
 
 
@@ -35,6 +39,7 @@ def load_data():
     summ = pd.read_excel(EXCEL_FILE, sheet_name="종합분석_결과").dropna(subset=["지표"])
 
     summ["지표_한글"] = summ["지표"].map(METRIC_KO)
+    summ["재계산"] = False  # 이상치 제거 후 직접 재계산한 값이면 True
     summ["비교_한글"] = summ["비교"].map(COMP_KO)
     # 모든 지표는 '낮아질수록 개선'으로 가정 (체중, BMI, 체지방, 허리둘레, HbA1c, 혈당)
     summ["판정"] = "유의한 차이 없음"
@@ -84,6 +89,36 @@ def loo_z(md, se):
     return out
 
 
+def drop_hba1c_outlier(study, summ):
+    """당화혈색소 이상치(Madjd 2017, 물 vs 제로음료) 한 건만 제거.
+    - 개별 연구 자료에서 그 행을 삭제
+    - 종합 결과 중 영향받는 '물 → 제로음료로 바꿈' HbA1c 한 칸만 남은 연구로 다시 합산(랜덤효과 근사)
+      (논문의 네트워크 합산값은 재현할 수 없어, 영향받는 칸만 직접 계산값으로 교체하고 '재계산'으로 표시)
+    """
+    mask = (study["지표"] == HBA1C_METRIC) & (study["연구(저자·연도)"] == HBA1C_OUTLIER_STUDY)
+    removed = study[mask].copy()
+    study2 = study[~mask].reset_index(drop=True)
+
+    s2 = summ.copy()
+    g = study2[(study2["지표"] == HBA1C_METRIC) & (study2["Treatment 1"] == "Water") & (study2["Treatment 2"] == "LNCSB")]
+    p = re_pool(g["Mean Difference"], g["Standard Error"])
+    idx = s2.index[(s2["지표"] == HBA1C_METRIC) & (s2["비교"] == "LNCSBs for Water")]
+    z = p["mu"] / p["se"]
+    s2.loc[idx, "종합 평균차이(MD)"] = p["mu"]
+    s2.loc[idx, "95% CI 하한"] = p["lo"]
+    s2.loc[idx, "95% CI 상한"] = p["hi"]
+    s2.loc[idx, "p값"] = math.erfc(abs(z) / math.sqrt(2))
+    s2.loc[idx, "비교 수"] = len(g)
+    s2.loc[idx, "재계산"] = True
+    # 판정·SE·z 다시 계산
+    s2["판정"] = "유의한 차이 없음"
+    s2.loc[s2["95% CI 상한"] < 0, "판정"] = "개선(유의)"
+    s2.loc[s2["95% CI 하한"] > 0, "판정"] = "악화(유의)"
+    s2["SE"] = (s2["95% CI 상한"] - s2["95% CI 하한"]) / (2 * Z95)
+    s2["z"] = s2["종합 평균차이(MD)"] / s2["SE"]
+    return study2, s2, removed
+
+
 @st.cache_data
 def flag_outliers(study, z_out):
     """지표 × 비교 그룹 안에서 연구별 이상치 점수(z)와 판정(정상/주의/이상치)을 붙임"""
@@ -127,6 +162,7 @@ def scorecard(summ):
                 f"<b>{r['종합 평균차이(MD)']:+.2f}</b><br>"
                 f"[{r['95% CI 하한']:.2f}, {r['95% CI 상한']:.2f}]<br>"
                 f"근거 {r['근거 확실성(논문 GRADE 표기)']}"
+                + ("<br>※이상치 제거 후 재계산" if r["재계산"] else "")
             )
             hr.append(
                 f"<b>{METRIC_KO[m]} · {COMP_KO[c]}</b><br>판정: {r['판정']}<br>"
@@ -475,7 +511,23 @@ st.caption(
     "청소년에게 그대로 일반화할 수 없습니다."
 )
 
-study_df, summ_df = load_data()
+study_full, summ_full = load_data()
+
+remove_hba1c = st.toggle(
+    f"당화혈색소 이상치 제거 ({HBA1C_OUTLIER_STUDY}, 물 vs 제로음료)", value=True,
+    help="다른 이상치(체중·허리둘레의 Peters 2016 등)는 그대로 둡니다. 끄면 원래 자료로 돌아갑니다.",
+)
+if remove_hba1c:
+    study_df, summ_df, removed_df = drop_hba1c_outlier(study_full, summ_full)
+    st.success(
+        f"당화혈색소 이상치 1건({HBA1C_OUTLIER_STUDY}, MD=+0.75%)을 제거했습니다. "
+        "영향받는 '물 → 제로음료로 바꿈' 당화혈색소 칸은 남은 연구로 다시 합산했고(※재계산 표시), "
+        "나머지 칸은 논문 값 그대로입니다.",
+        icon="✅",
+    )
+else:
+    study_df, summ_df = study_full, summ_full
+    removed_df = study_full.iloc[0:0]
 metric_options = list(dict.fromkeys(summ_df["지표"]))
 
 tab1, tab2, tab3, tab4 = st.tabs(["🎯 한눈에 보는 결론", "🔍 지표별 자세히", "🔎 이상치 분석", "📄 원자료·한계"])
@@ -523,6 +575,8 @@ with tab2:
                     f"오차 범위 {r['95% CI 하한']:.2f} ~ {r['95% CI 상한']:.2f} · "
                     f"근거 확실성 {grade} · 비교 {r['비교 수']}건"
                 )
+                if r["재계산"]:
+                    st.caption("※ 이상치 제거 후 직접 재계산한 값(랜덤효과 근사)")
 
     st.markdown("### ① 음료를 바꾸면 평균 얼마나 달라졌나")
     st.plotly_chart(simple_bars(t_df, unit, metric_ko), width="stretch")
@@ -570,6 +624,23 @@ with tab3:
         "(논문 합산 결과와 방향 일치 확인). 인용 전에 원문 PDF로 확인하세요.",
         icon="ℹ️",
     )
+
+    if remove_hba1c:
+        st.markdown("### 당화혈색소 이상치 제거 전 · 후")
+        full = flag_outliers(study_full, 3.0)
+        hg = full[(full["metric"] == "당화혈색소") & (full["comp"] == "물 vs 제로음료")].sort_values("MD").reset_index(drop=True)
+        hg["판정"] = np.where(hg["study"] == HBA1C_OUTLIER_STUDY, "이상치", "정상")
+        hg_keep = hg[hg["판정"] != "이상치"]
+        hp_all, hp_ex = re_pool(hg["MD"], hg["SE"]), re_pool(hg_keep["MD"], hg_keep["SE"])
+        st.plotly_chart(outlier_forest(hg, "%", hp_all, hp_ex), width="stretch")
+        b1, b2 = st.columns(2)
+        b1.metric("제거 전 (물 → 제로음료, 직접 합산)", fmt_ci(hp_all), ci_verdict(hp_all), delta_color="off")
+        b2.metric("제거 후", fmt_ci(hp_ex), ci_verdict(hp_ex), delta_color="off")
+        st.caption(
+            "빨간 사각형이 제거한 연구입니다. 이 한 건이 '제로음료를 마시면 당화혈색소가 높아진다'는 신호를 거의 혼자 만들었고, "
+            "빼면 0 근처로 돌아옵니다. 아래 분석(한눈에 보기 등)은 이 연구를 뺀 자료 기준입니다."
+        )
+        st.divider()
 
     oc1, oc2 = st.columns([2, 1])
     z_out = oc1.slider(
@@ -689,10 +760,13 @@ with tab4:
     st.subheader("종합분석 표")
     st.dataframe(
         summ_df[["지표_한글", "단위", "비교_한글", "종합 평균차이(MD)", "95% CI 하한", "95% CI 상한",
-                 "p값", "비교 수", "근거 확실성(논문 GRADE 표기)", "판정"]],
+                 "p값", "비교 수", "근거 확실성(논문 GRADE 표기)", "판정", "재계산"]],
         width="stretch",
         hide_index=True,
     )
+    if remove_hba1c and len(removed_df):
+        st.subheader("제거한 데이터")
+        st.dataframe(removed_df.drop(columns=["y라벨", "해석 주의"], errors="ignore"), width="stretch", hide_index=True)
     st.subheader("개별 연구 원자료")
     st.dataframe(study_df.drop(columns=["y라벨", "해석 주의"]), width="stretch", hide_index=True)
     st.subheader("출처")
