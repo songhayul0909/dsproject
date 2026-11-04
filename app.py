@@ -261,7 +261,7 @@ with tab1:
 
     st.subheader("① 성적표: 지표 × 비교")
     st.markdown("🟩 유의하게 낮아짐(개선)  ⬜ 유의한 차이 없음  🟥 유의하게 높아짐(악화) · 칸 안 숫자는 평균차이 [95% 신뢰구간], 근거 확실성")
-    st.plotly_chart(scorecard(summ_df), use_container_width=True)
+    st.plotly_chart(scorecard(summ_df), width="stretch")
 
     st.subheader("② 단위가 달라도 비교하기: 효과 신호의 세기(z값)")
     st.markdown(
@@ -269,7 +269,7 @@ with tab1:
         "평균차이를 표준오차로 나눈 z값으로 바꾸면 한 그래프에서 견줄 수 있습니다. "
         "막대가 회색 띠(±1.96)를 벗어나야 유의한 차이입니다."
     )
-    st.plotly_chart(zscore_bars(summ_df), use_container_width=True)
+    st.plotly_chart(zscore_bars(summ_df), width="stretch")
 
 # ---- 탭 2: 지표별
 with tab2:
@@ -278,13 +278,13 @@ with tab2:
     st.subheader(f"{METRIC_KO[metric]} ({unit})")
 
     st.markdown("**① 종합 결과** (논문이 여러 연구를 합친 값)")
-    st.plotly_chart(metric_forest(summ_df[summ_df["지표"] == metric], unit), use_container_width=True)
+    st.plotly_chart(metric_forest(summ_df[summ_df["지표"] == metric], unit), width="stretch")
 
     s_df = study_df[study_df["지표"] == metric]
     comps = sorted(s_df["비교"].unique())
     st.markdown(f"**② 개별 연구** ({len(s_df)}건)")
     chosen = st.multiselect("볼 비교 그룹", comps, default=comps)
-    st.plotly_chart(study_forest(s_df[s_df["비교"].isin(chosen)], unit), use_container_width=True)
+    st.plotly_chart(study_forest(s_df[s_df["비교"].isin(chosen)], unit), width="stretch")
     st.info(
         "개별 연구의 95% CI는 MD ± 1.96×SE로 계산한 근사값입니다. "
         "개별 연구 표의 MD 부호는 Treatment 1/2 순서와 논문 정의를 확인해야 해석할 수 있고, "
@@ -305,10 +305,10 @@ with tab3:
     st.dataframe(
         summ_df[["지표_한글", "단위", "비교_한글", "종합 평균차이(MD)", "95% CI 하한", "95% CI 상한",
                  "p값", "비교 수", "근거 확실성(논문 GRADE 표기)", "판정"]],
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
     st.subheader("개별 연구 원자료")
-    st.dataframe(study_df.drop(columns=["y라벨", "해석 주의"]), use_container_width=True, hide_index=True)
+    st.dataframe(study_df.drop(columns=["y라벨", "해석 주의"]), width="stretch", hide_index=True)
     st.subheader("출처")
-    st.dataframe(pd.read_excel(EXCEL_FILE, sheet_name="출처와_주의사항"), use_container_width=True, hide_index=True)
+    st.dataframe(pd.read_excel(EXCEL_FILE, sheet_name="출처와_주의사항"), width="stretch", hide_index=True)
