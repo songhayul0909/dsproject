@@ -308,7 +308,7 @@ def study_bars(df, unit, show_ci, with_comp):
         )
     fig.add_vline(x=0, line_color="black", line_width=2)
     fig.update_layout(
-        xaxis_title=f"연구별 평균차이 MD ({unit})   ◀ 왼쪽(−)  |  오른쪽(+) ▶",
+        xaxis_title=f"비교별 평균차이 MD ({unit})   ◀ 왼쪽(−)  |  오른쪽(+) ▶",
         yaxis=dict(autorange="reversed", categoryorder="array", categoryarray=df["라벨"].tolist()),
         height=max(360, 26 * len(df) + 150),
         legend=dict(orientation="h", y=-0.15),
@@ -390,7 +390,7 @@ with tab2:
                 grade = GRADE_KO.get(r["근거 확실성(논문 GRADE 표기)"], r["근거 확실성(논문 GRADE 표기)"])
                 st.caption(
                     f"오차 범위 {r['95% CI 하한']:.2f} ~ {r['95% CI 상한']:.2f} · "
-                    f"근거 확실성 {grade} · 연구 {r['비교 수']}건"
+                    f"근거 확실성 {grade} · 비교 {r['비교 수']}건"
                 )
 
     st.markdown("### ① 음료를 바꾸면 평균 얼마나 달라졌나")
@@ -401,7 +401,7 @@ with tab2:
         "검은 선이 0(굵은 세로선)을 지나면 '차이가 있다고 확신할 수 없다'는 뜻입니다."
     )
 
-    st.markdown("### ② 연구 하나하나는 어땠나")
+    st.markdown("### ② 비교 하나하나는 어땠나")
     comps = sorted(s_df["비교"].unique())
     choice = st.radio("비교 선택", ["전체"] + comps, horizontal=True)
     show_ci = st.checkbox("오차 범위 선도 함께 보기", value=False)
@@ -410,9 +410,11 @@ with tab2:
     n = len(view)
     n_neg = int((view["Mean Difference"] < 0).sum())
     n_sig = int((view["구분"] != "혼자서는 불확실 (오차 범위가 0 포함)").sum())
+    n_papers = view["연구(저자·연도)"].str.replace(r"\s*\(.*\)", "", regex=True).nunique()
     st.markdown(
-        f"**{n}개 연구 중 {n_neg}개**가 음수(−, 왼쪽), 혼자서도 유의한 연구는 **{n_sig}개**입니다. "
-        "대부분 혼자서는 불확실하지만, 여러 연구가 같은 방향이면 합쳐서 볼 때 유의해질 수 있습니다."
+        f"**{n}개 비교**(서로 다른 논문 {n_papers}편) 중 **{n_neg}개**가 음수(−, 왼쪽), 혼자서도 유의한 비교는 **{n_sig}개**입니다. "
+        "한 논문이 여러 비교(남녀, 감미료 종류, 용량)를 담고 있어서 논문 수보다 비교 수가 많습니다. "
+        "대부분 혼자서는 불확실하지만, 여러 비교가 같은 방향이면 합쳐서 볼 때 유의해질 수 있습니다."
     )
     st.plotly_chart(fig_s, width="stretch")
     st.caption(
