@@ -219,6 +219,105 @@ def study_forest(df, unit):
     return fig
 
 
+GRADE_KO = {"High": "높음", "Moderate": "보통", "Low": "낮음", "Very low": "매우 낮음"}
+VERDICT_EMOJI = {"개선(유의)": "✅", "유의한 차이 없음": "➖", "악화(유의)": "⚠️"}
+VERDICT_TEXT = {"개선(유의)": "유의하게 낮아짐", "유의한 차이 없음": "뚜렷한 차이 없음", "악화(유의)": "유의하게 높아짐"}
+VERDICT_COLOR = {"개선(유의)": "#2CA02C", "유의한 차이 없음": "#9AA5B1", "악화(유의)": "#D62728"}
+
+
+def simple_bars(df, unit, metric_ko):
+    """쉬운 종합 결과: 막대 = 평균 변화, 검은 선 = 오차 범위, 색 = 판정"""
+    df = df.reset_index(drop=True)
+    labels = [
+        f"{r['비교_한글']}<br>{VERDICT_EMOJI[r['판정']]} {VERDICT_TEXT[r['판정']]} ({r['종합 평균차이(MD)']:+.2f}{unit})"
+        for _, r in df.iterrows()
+    ]
+    md, lo, hi = df["종합 평균차이(MD)"], df["95% CI 하한"], df["95% CI 상한"]
+    fig = go.Figure(
+        go.Bar(
+            x=md,
+            y=labels,
+            orientation="h",
+            marker_color=[VERDICT_COLOR[j] for j in df["판정"]],
+            error_x=dict(
+                type="data",
+                symmetric=False,
+                array=(hi - md).tolist(),
+                arrayminus=(md - lo).tolist(),
+                color="#333333",
+                thickness=2.2,
+                width=8,
+            ),
+            customdata=df[["95% CI 하한", "95% CI 상한", "p값", "비교 수", "근거 확실성(논문 GRADE 표기)"]].values,
+            hovertemplate=(
+                "평균 변화 %{x:+.2f} " + unit + "<br>오차 범위 %{customdata[0]:.2f} ~ %{customdata[1]:.2f}"
+                "<br>p=%{customdata[2]:.3f} · 비교 %{customdata[3]}건 · 근거 %{customdata[4]}<extra></extra>"
+            ),
+        )
+    )
+    fig.add_vline(x=0, line_color="black", line_width=2)
+    fig.update_layout(
+        xaxis_title=f"{metric_ko} 변화 ({unit})   ◀ 왼쪽(−): 낮아짐   |   오른쪽(+): 높아짐 ▶",
+        yaxis=dict(autorange="reversed"),
+        height=330,
+        margin=dict(l=10, r=10, t=10, b=10),
+        showlegend=False,
+    )
+    return fig
+
+
+def study_bars(df, unit, show_ci, with_comp):
+    """쉬운 개별 연구: 연구별 막대(왼쪽=음수, 오른쪽=양수), 색 = 혼자서도 유의한지"""
+    df = df.copy().sort_values("Mean Difference").reset_index(drop=True)
+    df["라벨"] = df["y라벨"] if with_comp else df["연구(저자·연도)"]
+
+    def kind(r):
+        if r["CI 상한"] < 0:
+            return "혼자서도 유의하게 낮음"
+        if r["CI 하한"] > 0:
+            return "혼자서도 유의하게 높음"
+        return "혼자서는 불확실 (오차 범위가 0 포함)"
+
+    df["구분"] = df.apply(kind, axis=1)
+    colors = {
+        "혼자서도 유의하게 낮음": "#2CA02C",
+        "혼자서도 유의하게 높음": "#D62728",
+        "혼자서는 불확실 (오차 범위가 0 포함)": "#B8C4D6",
+    }
+    fig = go.Figure()
+    for k, c in colors.items():
+        g = df[df["구분"] == k]
+        if g.empty:
+            continue
+        fig.add_trace(
+            go.Bar(
+                x=g["Mean Difference"],
+                y=g["라벨"],
+                orientation="h",
+                name=k,
+                marker_color=c,
+                error_x=dict(type="data", array=(Z95 * g["Standard Error"]).tolist(), color="#555555", thickness=1.2)
+                if show_ci
+                else None,
+                customdata=g[["Standard Error", "CI 하한", "CI 상한", "원문 PDF 페이지"]].values,
+                hovertemplate=(
+                    "<b>%{y}</b><br>MD %{x:+.2f} " + unit + "<br>오차 범위 %{customdata[1]:.2f} ~ %{customdata[2]:.2f}"
+                    "<br>원문 PDF %{customdata[3]}쪽<extra></extra>"
+                ),
+            )
+        )
+    fig.add_vline(x=0, line_color="black", line_width=2)
+    fig.update_layout(
+        xaxis_title=f"연구별 평균차이 MD ({unit})   ◀ 왼쪽(−)  |  오른쪽(+) ▶",
+        yaxis=dict(autorange="reversed", categoryorder="array", categoryarray=df["라벨"].tolist()),
+        height=max(360, 26 * len(df) + 150),
+        legend=dict(orientation="h", y=-0.15),
+        margin=dict(l=10, r=10, t=10, b=10),
+        bargap=0.25,
+    )
+    return fig, df
+
+
 def verdict_markdown(summ):
     """데이터에서 자동으로 만든 한 줄 결론"""
     lines = []
@@ -275,21 +374,56 @@ with tab1:
 with tab2:
     metric = st.selectbox("지표 선택", metric_options, format_func=lambda m: f"{METRIC_KO[m]} ({m})")
     unit = summ_df.loc[summ_df["지표"] == metric, "단위"].iloc[0]
-    st.subheader(f"{METRIC_KO[metric]} ({unit})")
-
-    st.markdown("**① 종합 결과** (논문이 여러 연구를 합친 값)")
-    st.plotly_chart(metric_forest(summ_df[summ_df["지표"] == metric], unit), width="stretch")
-
+    metric_ko = METRIC_KO[metric]
+    t_df = summ_df[summ_df["지표"] == metric]
     s_df = study_df[study_df["지표"] == metric]
-    comps = sorted(s_df["비교"].unique())
-    st.markdown(f"**② 개별 연구** ({len(s_df)}건)")
-    chosen = st.multiselect("볼 비교 그룹", comps, default=comps)
-    st.plotly_chart(study_forest(s_df[s_df["비교"].isin(chosen)], unit), width="stretch")
-    st.info(
-        "개별 연구의 95% CI는 MD ± 1.96×SE로 계산한 근사값입니다. "
-        "개별 연구 표의 MD 부호는 Treatment 1/2 순서와 논문 정의를 확인해야 해석할 수 있고, "
-        "행들을 단순 평균해도 종합 결과는 재현되지 않습니다."
+
+    st.subheader(f"{metric_ko} ({unit})")
+    st.markdown("### 한 줄 결론")
+    cols = st.columns(3)
+    for col, (_, r) in zip(cols, t_df.iterrows()):
+        with col:
+            with st.container(border=True):
+                st.markdown(f"**{r['비교_한글']}**")
+                st.markdown(f"## {r['종합 평균차이(MD)']:+.2f} {unit}")
+                st.markdown(f"{VERDICT_EMOJI[r['판정']]} **{VERDICT_TEXT[r['판정']]}**")
+                grade = GRADE_KO.get(r["근거 확실성(논문 GRADE 표기)"], r["근거 확실성(논문 GRADE 표기)"])
+                st.caption(
+                    f"오차 범위 {r['95% CI 하한']:.2f} ~ {r['95% CI 상한']:.2f} · "
+                    f"근거 확실성 {grade} · 연구 {r['비교 수']}건"
+                )
+
+    st.markdown("### ① 음료를 바꾸면 평균 얼마나 달라졌나")
+    st.plotly_chart(simple_bars(t_df, unit, metric_ko), width="stretch")
+    st.caption(
+        "막대 = 평균 변화, 검은 선 = 오차 범위(95% 신뢰구간). "
+        "🟩 유의하게 낮아짐 · ⬜ 뚜렷한 차이 없음 · 🟥 유의하게 높아짐. "
+        "검은 선이 0(굵은 세로선)을 지나면 '차이가 있다고 확신할 수 없다'는 뜻입니다."
     )
+
+    st.markdown("### ② 연구 하나하나는 어땠나")
+    comps = sorted(s_df["비교"].unique())
+    choice = st.radio("비교 선택", ["전체"] + comps, horizontal=True)
+    show_ci = st.checkbox("오차 범위 선도 함께 보기", value=False)
+    view = s_df if choice == "전체" else s_df[s_df["비교"] == choice]
+    fig_s, view = study_bars(view, unit, show_ci, with_comp=(choice == "전체"))
+    n = len(view)
+    n_neg = int((view["Mean Difference"] < 0).sum())
+    n_sig = int((view["구분"] != "혼자서는 불확실 (오차 범위가 0 포함)").sum())
+    st.markdown(
+        f"**{n}개 연구 중 {n_neg}개**가 음수(−, 왼쪽), 혼자서도 유의한 연구는 **{n_sig}개**입니다. "
+        "대부분 혼자서는 불확실하지만, 여러 연구가 같은 방향이면 합쳐서 볼 때 유의해질 수 있습니다."
+    )
+    st.plotly_chart(fig_s, width="stretch")
+    st.caption(
+        "개별 연구의 MD 부호는 Treatment 1/2 순서와 논문 정의를 확인해야 해석할 수 있습니다. "
+        "같은 연구가 여러 행(예: 남성·여성, 여러 감미료)으로 들어 있어 행끼리 독립적이지 않습니다."
+    )
+
+    with st.expander("전문가용: 포리스트 플롯으로 보기"):
+        st.plotly_chart(metric_forest(t_df, unit), width="stretch")
+        st.plotly_chart(study_forest(s_df, unit), width="stretch")
+        st.caption("점 = 평균차이, 선 = 95% 신뢰구간(MD ± 1.96×SE 근사), 점 크기 = 연구의 정밀도.")
 
 # ---- 탭 3: 원자료·한계
 with tab3:
@@ -310,5 +444,5 @@ with tab3:
     )
     st.subheader("개별 연구 원자료")
     st.dataframe(study_df.drop(columns=["y라벨", "해석 주의"]), width="stretch", hide_index=True)
-    st.subheader("출처: https://jamanetwork.com/journals/jamanetworkopen/fullarticle/2790045?utm_source=chatgpt.com")
+    st.subheader("출처")
     st.dataframe(pd.read_excel(EXCEL_FILE, sheet_name="출처와_주의사항"), width="stretch", hide_index=True)
