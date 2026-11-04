@@ -1,9 +1,12 @@
+import numpy as np
 import pandas as pd
+import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
 EXCEL_FILE = "제로음료_임상시험_원자료_체중혈당.xlsx"
 Z95 = 1.96  # 95% 신뢰구간 계수
+Z_WARN = 2.0  # 이상치 '주의' 기준
 
 METRIC_KO = {
     "Body Weight": "체중",
@@ -22,6 +25,7 @@ COMP_KO = {
 GROUP_KO = {"SSB": "설탕음료", "Water": "물", "LNCSB": "제로음료"}
 COMP_COLORS = ["#2CA02C", "#4C78A8", "#F58518"]
 BETTER, NEUTRAL, WORSE = "#8FD18F", "#E3E3E3", "#F4A6A6"
+FLAG_COLOR = {"정상": "#5B8DB8", "주의": "#F58518", "이상치": "#D62728"}
 
 
 # ------------------------------------------------------------------ 데이터
@@ -46,6 +50,65 @@ def load_data():
     study["CI 하한"] = study["Mean Difference"] - Z95 * study["Standard Error"]
     study["CI 상한"] = study["Mean Difference"] + Z95 * study["Standard Error"]
     return study, summ
+
+
+# ------------------------------------------------------------------ 이상치 통계
+def re_pool(md, se):
+    """DerSimonian-Laird 랜덤효과 합산 (정규근사 95% CI)"""
+    md, se = np.asarray(md, float), np.asarray(se, float)
+    k = len(md)
+    if k == 0:
+        return dict(mu=np.nan, se=np.nan, lo=np.nan, hi=np.nan, tau2=np.nan, i2=np.nan, k=0)
+    w = 1 / se**2
+    mu_f = (w * md).sum() / w.sum()
+    q = (w * (md - mu_f) ** 2).sum()
+    c = w.sum() - (w**2).sum() / w.sum()
+    tau2 = max(0.0, (q - (k - 1)) / c) if k > 1 else 0.0
+    ws = 1 / (se**2 + tau2)
+    mu = (ws * md).sum() / ws.sum()
+    s = np.sqrt(1 / ws.sum())
+    i2 = max(0.0, (q - (k - 1)) / q) * 100 if k > 1 and q > 0 else 0.0
+    return dict(mu=mu, se=s, lo=mu - Z95 * s, hi=mu + Z95 * s, tau2=tau2, i2=i2, k=k)
+
+
+def loo_z(md, se):
+    """한 연구를 뺀 나머지로 합산한 값과 얼마나 다른지(표준화). 연구 3개 미만이면 계산 불가(NaN)"""
+    md, se = np.asarray(md, float), np.asarray(se, float)
+    out = np.full(len(md), np.nan)
+    if len(md) < 3:
+        return out
+    for i in range(len(md)):
+        m = np.arange(len(md)) != i
+        p = re_pool(md[m], se[m])
+        out[i] = (md[i] - p["mu"]) / np.sqrt(se[i] ** 2 + p["tau2"] + p["se"] ** 2)
+    return out
+
+
+@st.cache_data
+def flag_outliers(study, z_out):
+    """지표 × 비교 그룹 안에서 연구별 이상치 점수(z)와 판정(정상/주의/이상치)을 붙임"""
+    d = study.rename(columns={"연구(저자·연도)": "study", "Mean Difference": "MD", "Standard Error": "SE"}).copy()
+    d["metric"], d["comp"] = d["지표_한글"], d["비교"]
+    d["lo"], d["hi"] = d["CI 하한"], d["CI 상한"]
+    d["z"] = np.nan
+    for _, idx in d.groupby(["metric", "comp"]).groups.items():
+        d.loc[idx, "z"] = loo_z(d.loc[idx, "MD"], d.loc[idx, "SE"])
+    d["판정"] = np.where(d.z.abs() >= z_out, "이상치", np.where(d.z.abs() >= Z_WARN, "주의", "정상"))
+    return d
+
+
+def fmt_ci(p):
+    return f"{p['mu']:+.2f} [{p['lo']:.2f}, {p['hi']:.2f}]"
+
+
+def ci_verdict(p):
+    if np.isnan(p["mu"]):
+        return "-"
+    if p["hi"] < 0:
+        return "유의하게 낮아짐"
+    if p["lo"] > 0:
+        return "유의하게 높아짐"
+    return "차이 확신 못함(CI가 0 포함)"
 
 
 # ------------------------------------------------------------------ 그래프
@@ -336,6 +399,74 @@ def verdict_markdown(summ):
     return "\n".join(lines)
 
 
+# ---- 이상치 분석용 그래프
+def outlier_heatmap(d, comps):
+    """연구 × 지표 이상치 점수(z) 히트맵"""
+    h = d[d["comp"].isin(comps)].copy()
+    h["row"] = h["study"] + " (" + h["comp"] + ")"
+    piv = h.pivot_table(index="row", columns="metric", values="z", aggfunc="first")
+    piv = piv.reindex(columns=[m for m in METRIC_KO.values() if m in piv.columns])
+    fig = px.imshow(piv, color_continuous_scale="RdBu_r", zmin=-5, zmax=5, aspect="auto",
+                    labels=dict(color="z"), text_auto=".1f")
+    fig.update_layout(height=max(480, 22 * len(piv)), xaxis_side="top", margin=dict(l=10, r=10, t=40, b=10))
+    return fig
+
+
+def outlier_forest(g, unit, p_all, p_ex):
+    """연구별 MD ± 95% CI (이상치 색 구분) + 합산(전체 / 이상치 제외)"""
+    prec = 1 / g["SE"]
+    g = g.assign(size=8 + 16 * prec / prec.max())
+    fig = go.Figure()
+    for lab, col in FLAG_COLOR.items():
+        s = g[g["판정"] == lab]
+        if s.empty:
+            continue
+        fig.add_trace(go.Scatter(
+            x=s["MD"], y=s["study"], mode="markers", name=lab,
+            marker=dict(color=col, symbol="square", size=s["size"].tolist()),
+            error_x=dict(type="data", symmetric=False, array=(s["hi"] - s["MD"]).tolist(),
+                         arrayminus=(s["MD"] - s["lo"]).tolist(), color=col, thickness=2),
+            customdata=np.c_[s["SE"], s["z"], s["원문 PDF 페이지"]],
+            hovertemplate="<b>%{y}</b><br>MD %{x:+.2f}  (SE %{customdata[0]:.2f})"
+                          "<br>이상치 점수 z=%{customdata[1]:.1f}<br>원문 PDF %{customdata[2]}쪽<extra></extra>"))
+    for p, name, col, sym in [(p_all, "합산(전체)", "#333333", "diamond"),
+                              (p_ex, "합산(이상치 제외)", "#2CA02C", "diamond-open")]:
+        fig.add_trace(go.Scatter(
+            x=[p["mu"]], y=[name], mode="markers", name=name,
+            marker=dict(color=col, symbol=sym, size=16, line=dict(width=2)),
+            error_x=dict(type="data", symmetric=False, array=[p["hi"] - p["mu"]],
+                         arrayminus=[p["mu"] - p["lo"]], color=col, thickness=3)))
+    fig.add_vline(x=0, line_dash="dash", line_color="black")
+    order = ["합산(이상치 제외)", "합산(전체)"] + g["study"].tolist()[::-1]
+    fig.update_layout(
+        height=max(400, 32 * (len(g) + 3) + 100),
+        xaxis_title=f"평균차이 MD ({unit})   ◀ 왼쪽(−): 제로음료가 더 낮음  |  오른쪽(+): 더 높음 ▶",
+        yaxis=dict(categoryorder="array", categoryarray=order),
+        legend=dict(orientation="h", y=1.08), margin=dict(l=10, r=10, t=40, b=10))
+    return fig
+
+
+def exclusion_chart(res):
+    """지표·비교별 합산 MD: 전체 vs 이상치 제외"""
+    n = len(res)
+    y = np.arange(n)
+    fig = go.Figure()
+    for key, name, col, off in [("pa", "전체", "#333333", 0.15), ("pe", "이상치 제외", "#2CA02C", -0.15)]:
+        ps = res[key].tolist()
+        fig.add_trace(go.Scatter(
+            x=[p["mu"] for p in ps], y=y + off, mode="markers", name=name, marker=dict(color=col, size=10),
+            error_x=dict(type="data", symmetric=False, array=[p["hi"] - p["mu"] for p in ps],
+                         arrayminus=[p["mu"] - p["lo"] for p in ps], color=col)))
+    fig.add_vline(x=0, line_dash="dash", line_color="black")
+    fig.update_layout(
+        height=max(480, 56 * n), legend=dict(orientation="h", y=1.05),
+        xaxis_title="합산 MD (지표마다 단위가 다름)   ◀ 제로음료가 더 낮음  |  더 높음 ▶",
+        yaxis=dict(tickmode="array", tickvals=y.tolist(),
+                   ticktext=(res["지표"] + " · " + res["비교"]).tolist(), autorange="reversed"),
+        margin=dict(l=10, r=10, t=40, b=10))
+    return fig
+
+
 # ------------------------------------------------------------------ 화면
 st.set_page_config(page_title="제로칼로리 음료의 효과가 있을까?", layout="wide")
 st.title("제로칼로리 음료, 효과가 있을까?")
@@ -347,7 +478,7 @@ st.caption(
 study_df, summ_df = load_data()
 metric_options = list(dict.fromkeys(summ_df["지표"]))
 
-tab1, tab2, tab3 = st.tabs(["🎯 한눈에 보는 결론", "🔍 지표별 자세히", "📄 원자료·한계"])
+tab1, tab2, tab3, tab4 = st.tabs(["🎯 한눈에 보는 결론", "🔍 지표별 자세히", "🔎 이상치 분석", "📄 원자료·한계"])
 
 # ---- 탭 1: 결론
 with tab1:
@@ -427,15 +558,133 @@ with tab2:
         st.plotly_chart(study_forest(s_df, unit), width="stretch")
         st.caption("점 = 평균차이, 선 = 95% 신뢰구간(MD ± 1.96×SE 근사), 점 크기 = 연구의 정밀도.")
 
-# ---- 탭 3: 원자료·한계
+# ---- 탭 3: 이상치 분석
 with tab3:
+    st.subheader("연구별 이상치 찾기")
+    st.markdown(
+        "같은 지표·같은 비교 안에서 **다른 연구들과 크게 벗어난 값**을 찾고, "
+        "그 값을 빼면 제로음료 효과의 결론이 바뀌는지 확인합니다."
+    )
+    st.info(
+        "부호 해석 가정: 제로음료가 들어간 비교는 **MD < 0 이면 제로음료 쪽이 더 낮음**으로 봤습니다"
+        "(논문 합산 결과와 방향 일치 확인). 인용 전에 원문 PDF로 확인하세요.",
+        icon="ℹ️",
+    )
+
+    oc1, oc2 = st.columns([2, 1])
+    z_out = oc1.slider(
+        "이상치 기준 |z|", 2.0, 5.0, 3.0, 0.5,
+        help="나머지 연구들로 합산한 값에서 벗어난 정도(표준화 점수). 2 이상은 '주의'로 표시",
+    )
+    with_sw = oc2.checkbox("설탕음료 vs 물 비교도 포함", value=False)
+
+    od = flag_outliers(study_df, z_out)
+    zero_comps = [c for c in sorted(od["comp"].unique()) if "제로음료" in c]
+    o_comps = zero_comps + ([c for c in sorted(od["comp"].unique()) if "제로음료" not in c] if with_sw else [])
+    o_metrics = [m for m in METRIC_KO.values() if m in set(od["metric"])]
+
+    o1, o2, o3, o4 = st.tabs(["한눈에 보기", "지표별 포레스트", "이상치 빼면 결론이 바뀌나?", "데이터 점검"])
+
+    with o1:
+        st.markdown("진한 빨강·파랑일수록 같은 지표의 다른 연구들과 많이 다른 값입니다. (연구 3개 미만인 칸은 빈칸)")
+        st.plotly_chart(outlier_heatmap(od, o_comps), width="stretch")
+        found = od[(od["판정"] == "이상치") & od["comp"].isin(o_comps)]
+        if len(found):
+            st.error("이상치: " + " · ".join(
+                f"**{r.study}** ({r.metric}, {r.comp}, MD={r.MD:+.2f}, z={r.z:.1f})" for r in found.itertuples()))
+        else:
+            st.success("현재 기준에서는 이상치가 없습니다.")
+        warn = od[(od["판정"] == "주의") & od["comp"].isin(o_comps)]
+        if len(warn):
+            st.warning("주의(경계): " + " · ".join(
+                f"{r.study} ({r.metric}, z={r.z:.1f})" for r in warn.itertuples()))
+
+    with o2:
+        f1, f2 = st.columns(2)
+        o_metric = f1.selectbox("지표", o_metrics, key="o_metric")
+        o_comp = f2.radio("비교", o_comps, horizontal=True, key="o_comp")
+        og = od[(od["metric"] == o_metric) & (od["comp"] == o_comp)].sort_values("MD").reset_index(drop=True)
+        if og.empty:
+            st.info("해당 조합의 연구가 없습니다.")
+        else:
+            o_unit = og["단위"].iloc[0]
+            keep = og[og["판정"] != "이상치"]
+            p_all, p_ex = re_pool(og["MD"], og["SE"]), re_pool(keep["MD"], keep["SE"])
+            st.plotly_chart(outlier_forest(og, o_unit, p_all, p_ex), width="stretch")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("합산 MD (전체)", fmt_ci(p_all), ci_verdict(p_all), delta_color="off")
+            m2.metric("합산 MD (이상치 제외)", fmt_ci(p_ex), ci_verdict(p_ex), delta_color="off")
+            m3.metric("연구 간 이질성 I²", f"{p_all['i2']:.0f}%")
+            st.caption(
+                "사각형 크기 = 연구 정밀도, 선 = 95% 신뢰구간. 이상치 빨강, 주의 주황. "
+                "합산은 랜덤효과(DerSimonian-Laird) 근사라 논문의 네트워크 메타분석 값과 조금 다를 수 있습니다."
+            )
+
+    with o3:
+        rows = []
+        for m in o_metrics:
+            for c in zero_comps:
+                g = od[(od["metric"] == m) & (od["comp"] == c)]
+                if g.empty:
+                    continue
+                k = g[g["판정"] != "이상치"]
+                pa, pe = re_pool(g["MD"], g["SE"]), re_pool(k["MD"], k["SE"])
+                rows.append(dict(
+                    지표=m, 비교=c, 연구수=len(g),
+                    제외한연구=", ".join(g[g["판정"] == "이상치"]["study"]) or "-",
+                    전체=fmt_ci(pa), 이상치제외=fmt_ci(pe),
+                    판정_전체=ci_verdict(pa), 판정_제외=ci_verdict(pe),
+                    변화="⚠️ 바뀜" if ci_verdict(pa) != ci_verdict(pe) else "", pa=pa, pe=pe,
+                ))
+        res = pd.DataFrame(rows)
+        st.plotly_chart(exclusion_chart(res), width="stretch")
+        st.dataframe(res.drop(columns=["pa", "pe"]), width="stretch", hide_index=True)
+        changed = res[res["변화"] != ""]
+        if len(changed):
+            st.warning("이상치를 빼면 판정이 바뀌는 항목: " + ", ".join(
+                f"{r.지표}({r.비교})" for r in changed.itertuples()))
+        else:
+            st.success("이상치를 빼도 유의성 판정은 바뀌지 않습니다.")
+        st.caption("연구가 2~4개뿐인 칸은 이상치 판정·합산 모두 불안정하니 참고용으로만 보세요.")
+
+    with o4:
+        st.markdown("**1) 비교 수: 개별 자료 행 수 vs 종합분석표의 '비교 수'**")
+        cnt = od.groupby("metric").size().rename("개별 자료 행수")
+        sc = summ_df.groupby("지표_한글")["비교 수"].first().rename("종합분석표 비교 수")
+        chk = pd.concat([cnt, sc], axis=1).reindex(o_metrics)
+        chk["일치"] = np.where(chk.iloc[:, 0] == chk.iloc[:, 1], "✅", "❌ 불일치")
+        st.dataframe(chk, width="stretch")
+
+        st.markdown("**2) 삼각 일관성**: 같은 연구에서 (설탕-물) ≈ (설탕-제로) − (물-제로) 이어야 합니다.")
+        tri = []
+        for (m, stu), g in od.groupby(["metric", "study"]):
+            v = g.set_index("comp")["MD"]
+            need = {"설탕음료 vs 제로음료", "물 vs 제로음료", "설탕음료 vs 물"}
+            if need <= set(v.index):
+                exp = v["설탕음료 vs 제로음료"] - v["물 vs 제로음료"]
+                tri.append(dict(지표=m, 연구=stu, 기대값=round(exp, 2), 보고값=v["설탕음료 vs 물"],
+                                차이=round(abs(exp - v["설탕음료 vs 물"]), 2)))
+        tri = pd.DataFrame(tri)
+        if len(tri):
+            tri["판정"] = np.where(tri["차이"] > 0.15, "❌ 불일치 - 원문 확인", "✅")
+            st.dataframe(tri, width="stretch", hide_index=True)
+
+        st.markdown("**3) 판정 포함 전체 데이터**")
+        show_cols = ["metric", "단위", "study", "comp", "MD", "SE", "z", "판정", "원문 PDF 페이지"]
+        st.dataframe(od[show_cols].round(2), width="stretch", hide_index=True)
+        st.download_button("판정 포함 CSV 다운로드", od[show_cols].round(3).to_csv(index=False).encode("utf-8-sig"),
+                           "outlier_flags.csv", "text/csv")
+
+# ---- 탭 4: 원자료·한계
+with tab4:
     st.subheader("결과를 읽을 때 주의할 점")
     st.markdown(
         "- 대상은 **성인 임상시험**입니다. 청소년에게 그대로 적용할 수 없습니다.\n"
         "- 근거 확실성(GRADE)이 대부분 **Low**입니다. 연구가 더 나오면 결과가 바뀔 수 있습니다.\n"
         "- 신뢰구간이 0을 지나면 '효과가 없다'가 아니라 **'이 자료로는 차이를 확신할 수 없다'**는 뜻입니다.\n"
         "- 이 자료는 음료를 **바꿨을 때**의 변화입니다. 제로음료를 추가로 마시는 경우와는 다릅니다.\n"
-        "- 모든 지표를 '낮을수록 개선'으로 가정한 색 구분입니다. 건강한 성인에게는 작은 차이가 임상적으로 의미 없을 수 있습니다."
+        "- 모든 지표를 '낮을수록 개선'으로 가정한 색 구분입니다. 건강한 성인에게는 작은 차이가 임상적으로 의미 없을 수 있습니다.\n"
+        "- 이상치 분석의 합산값은 직접 계산한 근사치라, 위의 논문 종합 결과와 소수점 단위로 다를 수 있습니다."
     )
     st.subheader("종합분석 표")
     st.dataframe(
