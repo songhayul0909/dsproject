@@ -310,5 +310,5 @@ with tab3:
     )
     st.subheader("개별 연구 원자료")
     st.dataframe(study_df.drop(columns=["y라벨", "해석 주의"]), width="stretch", hide_index=True)
-    st.subheader("출처")
+    st.subheader("출처: https://jamanetwork.com/journals/jamanetworkopen/fullarticle/2790045?utm_source=chatgpt.com")
     st.dataframe(pd.read_excel(EXCEL_FILE, sheet_name="출처와_주의사항"), width="stretch", hide_index=True)
