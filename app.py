@@ -1,7 +1,7 @@
-"""제로음료 효과 '판정(분류)' — 분류 모델 3종 + 로지스틱 임계값 튜닝 + 메타분석 모델 시각 비교
+"""제로음료 효과 '판정(분류)' — 분류 모델 3종 + 메타분석 모델 시각 비교
 데이터는 이 파일 안에 내장되어 있어 엑셀 파일 없이 바로 실행됩니다.
 분류 대상: 지표 × 비교 칸마다  개선 / 불분명 / 악화  (모든 지표는 '낮을수록 개선'으로 가정)
-실행: pip install streamlit pandas numpy scipy scikit-learn plotly  →  streamlit run app.py
+실행: pip install -r requirements.txt  →  streamlit run app.py
 """
 import io
 
@@ -485,198 +485,6 @@ def run(d, s):
     return cells
 
 
-# ───────────────────────── 로지스틱 회귀 임계값 튜닝 ─────────────────────────
-# 로지스틱 회귀 하나만 leave-one-paper-out으로 예측 확률을 만든 뒤, 임계값을 바꿔 가며 성능이 어떻게 변하는지 보고
-# 기준(Youden J / F1 / MCC / 비용 / 재현율 하한)에 따라 최적 임계값을 찾는다.
-THR_GRID = np.round(np.arange(0.01, 1.00, 0.01), 2)
-TARGETS = {"방향: 제로음료 쪽이 낮음(−)": "dir", "유의성: '개선'(CI 전체가 0 아래) vs 나머지": "sig"}
-CRITERIA = ["Youden J (민감도+특이도−1)", "F1", "MCC", "비용 최소화 (FN·FP 비용)", "재현율 하한 아래 정밀도 최대"]
-
-
-@st.cache_data
-def logit_oof(x, target, C, balanced):
-    """로지스틱 회귀의 leave-one-paper-out 양성 확률"""
-    y = ((x.true_dir == DIRS[0]) if target == "dir" else (x.true_sig == "개선")).astype(int).values
-    F, oof = x[CAT + NUM], np.zeros(len(x))
-    for tr, te in LeaveOneGroupOut().split(F, y, groups=x.paper):
-        if len(np.unique(y[tr])) < 2:  # 학습에 클래스가 하나뿐이면 평활된 사전확률로 대체
-            oof[te] = (y[tr].sum() + 1) / (len(tr) + 2)
-            continue
-        pipe = clf_pipe(CLF_NAMES[0]).set_params(clf__C=C, clf__class_weight="balanced" if balanced else None)
-        oof[te] = pipe.fit(F.iloc[tr], y[tr]).predict_proba(F.iloc[te])[:, 1]
-    return y, oof
-
-
-def sweep(y, p, grid=THR_GRID):
-    """임계값 격자 전체에 대한 혼동행렬·지표를 한 번에 계산"""
-    pred, pos = p[None, :] >= grid[:, None], (y == 1)[None, :]
-    tp, fp = (pred & pos).sum(1).astype(float), (pred & ~pos).sum(1).astype(float)
-    fn, tn = (~pred & pos).sum(1).astype(float), (~pred & ~pos).sum(1).astype(float)
-    div = lambda a, b: np.divide(a, b, out=np.zeros_like(a), where=b > 0)
-    rec, spec, prec = div(tp, tp + fn), div(tn, tn + fp), div(tp, tp + fp)
-    den = np.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
-    return pd.DataFrame(dict(thr=grid, tp=tp, fp=fp, fn=fn, tn=tn, 재현율=rec, 특이도=spec, 정밀도=prec,
-                             F1=div(2 * prec * rec, prec + rec), 균형정확도=(rec + spec) / 2, 정확도=(tp + tn) / len(y),
-                             MCC=div(tp * tn - fp * fn, den), Youden=rec + spec - 1))
-
-
-def pick_thr(sw, crit, c_fn=1.0, c_fp=1.0, min_rec=0.8):
-    """기준별 최적 임계값 (동점이면 가운데 값)"""
-    if crit == CRITERIA[0]:
-        s = sw.Youden.values
-    elif crit == CRITERIA[1]:
-        s = sw.F1.values
-    elif crit == CRITERIA[2]:
-        s = sw.MCC.values
-    elif crit == CRITERIA[3]:
-        s = -(c_fn * sw.fn.values + c_fp * sw.fp.values)
-    else:
-        s = np.where(sw.재현율.values >= min_rec, sw.정밀도.values, -np.inf)
-    if not np.isfinite(s).any():  # 재현율 하한을 만족하는 임계값이 없음
-        return float(sw.thr.min())
-    idx = np.flatnonzero(s >= s.max() - 1e-12)
-    return float(sw.thr.values[idx[len(idx) // 2]])
-
-
-def boot_thr(papers, y, p, crit, c_fn, c_fp, min_rec, B=300, seed=0):
-    """논문 단위 부트스트랩: 논문을 복원추출해 최적 임계값이 얼마나 흔들리는지 확인"""
-    rng, uniq = np.random.default_rng(seed), pd.unique(papers)
-    grp, out = {k: np.flatnonzero(papers == k) for k in uniq}, []
-    for _ in range(B):
-        ids = np.concatenate([grp[k] for k in rng.choice(uniq, len(uniq))])
-        if y[ids].min() == y[ids].max():
-            continue
-        out.append(pick_thr(sweep(y[ids], p[ids]), crit, c_fn, c_fp, min_rec))
-    return np.array(out)
-
-
-def render_threshold_tab(X):
-    st.subheader("로지스틱 회귀 · 분류 임계값 튜닝")
-    st.caption("확률이 임계값 이상이면 '양성'으로 분류합니다. 임계값을 낮추면 놓치는 양성(FN)이 줄고 오경보(FP)가 늘며, 높이면 반대가 됩니다. "
-               "아래 예측 확률은 leave-one-paper-out으로 만든 것이라 같은 논문의 정답이 학습에 들어가지 않습니다.")
-    if len(X) < 10 or X.paper.nunique() < 4:
-        st.info("데이터가 부족합니다(논문 4편 이상, 10행 이상 필요).")
-        return
-
-    c1, c2, c3 = st.columns([2, 1, 1])
-    tgt_name = c1.radio("예측 대상 (양성 클래스)", list(TARGETS), key="th_tgt")
-    C = c2.select_slider("규제 강도 C", options=[0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0], value=1.0, key="th_C",
-                         help="작을수록 규제가 강해 확률이 0.5 근처로 모입니다.")
-    bal = c3.checkbox("클래스 가중치 balanced", value=True, key="th_bal",
-                      help="켜면 소수 클래스를 더 중요하게 학습해 확률이 한쪽으로 쏠리는 것을 줄입니다.")
-    target = TARGETS[tgt_name]
-    pos_nm, neg_nm = ("낮음(−)", "높음(+)") if target == "dir" else ("개선", "그 외")
-
-    y, p = logit_oof(X, target, C, bal)
-    if y.sum() in (0, len(y)):
-        st.warning("이 대상에서는 한 클래스만 존재해 임계값을 튜닝할 수 없습니다. 다른 대상을 선택하세요.")
-        return
-
-    k1, k2 = st.columns([2, 3])
-    crit = k1.selectbox("최적 임계값 기준", CRITERIA, key="th_crit")
-    c_fn, c_fp, min_rec = 1.0, 1.0, 0.8
-    with k2:
-        if crit == CRITERIA[3]:
-            a, b = st.columns(2)
-            c_fn = a.number_input(f"FN 비용 ('{pos_nm}'을 놓침)", min_value=0.0, value=2.0, step=0.5, key="th_cfn")
-            c_fp = b.number_input(f"FP 비용 ('{pos_nm}'이 아닌데 양성으로 분류)", min_value=0.0, value=1.0, step=0.5, key="th_cfp")
-        elif crit == CRITERIA[4]:
-            min_rec = st.slider("재현율 하한", 0.1, 1.0, 0.8, 0.05, key="th_minrec")
-        else:
-            st.caption("균형정확도는 Youden J와 같은 지점에서 최대가 됩니다. 불균형이 심하면 정확도 대신 J·F1·MCC를 쓰세요.")
-
-    sw = sweep(y, p)
-    best = pick_thr(sw, crit, c_fn, c_fp, min_rec)
-    thr = st.slider("임계값 (직접 조절)", 0.01, 0.99, float(best), 0.01, key=f"th_thr_{crit}_{best}",
-                    help="기본값은 위에서 고른 기준의 최적값입니다. 움직여서 지표가 어떻게 변하는지 확인하세요.")
-    row = sw.loc[(sw.thr - thr).abs().idxmin()]
-    r05 = sw.loc[(sw.thr - 0.5).abs().idxmin()]
-    st.caption(f"기준 '{crit}'의 최적 임계값 = **{best:.2f}** · 현재 {thr:.2f} · 양성 비율 {y.mean():.0%} (n={len(y)}, 양성 {int(y.sum())}) · "
-               f"AUC {roc_auc_score(y, p):.2f}  (AUC는 임계값과 무관한 순위 성능)")
-
-    for col, k in zip(st.columns(6), ["재현율", "정밀도", "특이도", "F1", "균형정확도", "MCC"]):
-        col.metric(k, f"{row[k]:.2f}", f"{row[k] - r05[k]:+.2f} vs 0.5", delta_color="off")
-
-    # 1) 임계값별 지표 곡선
-    mcol = {"재현율": "#E45756", "정밀도": "#4C78A8", "특이도": "#54A24B", "F1": "#F58518", "균형정확도": "#B279A2", "MCC": "#7F7F7F"}
-    f = go.Figure()
-    for k, col in mcol.items():
-        f.add_trace(go.Scatter(x=sw.thr, y=sw[k], mode="lines", name=k, line=dict(color=col, width=2.5)))
-    f.add_vline(x=thr, line_color="black")
-    f.add_vline(x=best, line_color="red", line_dash="dash", annotation_text=f"최적 {best:.2f}", annotation_position="top")
-    f.update_layout(title="임계값에 따른 지표 변화 (검은 선=현재, 빨간 점선=최적)", height=380, xaxis_title="임계값",
-                    margin=dict(l=10, r=10, t=50, b=10), legend=dict(orientation="h", y=-0.2))
-    st.plotly_chart(f, width="stretch")
-
-    # 2) ROC · PR · 비용 곡선
-    g1, g2, g3 = st.columns(3)
-    roc = pd.concat([pd.DataFrame(dict(x=[1.0], y=[1.0])), pd.DataFrame(dict(x=1 - sw.특이도, y=sw.재현율)),
-                     pd.DataFrame(dict(x=[0.0], y=[0.0]))])
-    f = go.Figure([go.Scatter(x=roc.x, y=roc.y, mode="lines", line=dict(color="#4C78A8", width=3), name="ROC"),
-                   go.Scatter(x=[0, 1], y=[0, 1], mode="lines", line=dict(dash="dot", color="gray"), showlegend=False),
-                   go.Scatter(x=[1 - row.특이도], y=[row.재현율], mode="markers", marker=dict(size=14, color="black"), name=f"현재 {thr:.2f}")])
-    f.update_layout(title="ROC", height=330, xaxis_title="거짓양성률", yaxis_title="재현율", margin=dict(l=10, r=10, t=50, b=10),
-                    legend=dict(orientation="h", y=-0.3))
-    g1.plotly_chart(f, width="stretch")
-    pr = sw[(sw.tp + sw.fp) > 0]
-    f = go.Figure([go.Scatter(x=pr.재현율, y=pr.정밀도, mode="lines", line=dict(color="#54A24B", width=3), name="PR"),
-                   go.Scatter(x=[0, 1], y=[y.mean()] * 2, mode="lines", line=dict(dash="dot", color="gray"), name="무작위(양성 비율)"),
-                   go.Scatter(x=[row.재현율], y=[row.정밀도], mode="markers", marker=dict(size=14, color="black"), name=f"현재 {thr:.2f}")])
-    f.update_layout(title="정밀도–재현율", height=330, xaxis_title="재현율", yaxis_title="정밀도", yaxis=dict(range=[0, 1.02]),
-                    margin=dict(l=10, r=10, t=50, b=10), legend=dict(orientation="h", y=-0.3))
-    g2.plotly_chart(f, width="stretch")
-    cost = c_fn * sw.fn + c_fp * sw.fp
-    f = go.Figure([go.Scatter(x=sw.thr, y=cost, mode="lines", line=dict(color="#E45756", width=3), name="총비용"),
-                   go.Scatter(x=[thr], y=[c_fn * row.fn + c_fp * row.fp], mode="markers", marker=dict(size=14, color="black"), name="현재")])
-    f.update_layout(title=f"총비용 (FN×{c_fn:g} + FP×{c_fp:g})", height=330, xaxis_title="임계값", margin=dict(l=10, r=10, t=50, b=10),
-                    legend=dict(orientation="h", y=-0.3))
-    g3.plotly_chart(f, width="stretch")
-    if crit != CRITERIA[3]:
-        g3.caption("비용 곡선은 FN·FP 비용을 직접 정하려면 '비용 최소화' 기준을 선택하세요(지금은 1:1 가정).")
-
-    # 3) 확률 분포 · 혼동행렬
-    h1, h2 = st.columns([3, 2])
-    f = go.Figure()
-    for v, nm, col in [(1, pos_nm, "#4C78A8"), (0, neg_nm, "#F58518")]:
-        f.add_trace(go.Histogram(x=p[y == v], name=f"실제 {nm}", marker_color=col, opacity=0.65, xbins=dict(start=0, end=1, size=0.05)))
-    f.add_vline(x=thr, line_color="black")
-    f.update_layout(barmode="overlay", title="예측 확률 분포 (두 분포가 겹칠수록 어떤 임계값도 완벽할 수 없음)", height=330,
-                    xaxis_title=f"P({pos_nm})", margin=dict(l=10, r=10, t=50, b=10), legend=dict(orientation="h", y=-0.3))
-    h1.plotly_chart(f, width="stretch")
-    z = [[row.tn, row.fp], [row.fn, row.tp]]
-    f = go.Figure(go.Heatmap(z=z, x=[f"예측 {neg_nm}", f"예측 {pos_nm}"], y=[f"실제 {neg_nm}", f"실제 {pos_nm}"], text=z,
-                             texttemplate="%{text:.0f}", showscale=False, colorscale="Blues", xgap=2, ygap=2))
-    f.update_yaxes(autorange="reversed")
-    f.update_layout(title=f"혼동행렬 (임계값 {thr:.2f})", height=330, margin=dict(l=10, r=10, t=50, b=10))
-    h2.plotly_chart(f, width="stretch")
-
-    # 4) 최적 임계값의 안정성 (논문 단위 부트스트랩)
-    if st.checkbox("최적 임계값이 얼마나 안정적인지 확인 (논문 단위 부트스트랩 300회)", key="th_boot"):
-        bt = boot_thr(X.paper.values, y, p, crit, c_fn, c_fp, min_rec)
-        if len(bt) < 10:
-            st.info("유효한 부트스트랩 표본이 부족합니다.")
-        else:
-            lo, md, hi = np.percentile(bt, [5, 50, 95])
-            f = go.Figure(go.Histogram(x=bt, xbins=dict(start=0, end=1, size=0.02), marker_color="#B279A2"))
-            f.add_vline(x=best, line_color="red", line_dash="dash")
-            f.update_layout(title=f"부트스트랩 최적 임계값 분포: 중앙값 {md:.2f}, 90% 구간 [{lo:.2f}, {hi:.2f}]", height=300,
-                            xaxis_title="최적 임계값", margin=dict(l=10, r=10, t=50, b=10))
-            st.plotly_chart(f, width="stretch")
-            st.caption("구간이 넓으면 최적 임계값이 표본 몇 건에 좌우된다는 뜻입니다. 이때는 최적값 하나보다 '넓게 평평한 구간'을 고르는 편이 안전합니다.")
-
-    with st.expander("연구별 예측 결과 (현재 임계값 기준)"):
-        pred = p >= thr
-        out = X[["metric", "study", "edge"]].assign(실제=np.where(y == 1, pos_nm, neg_nm), 확률=p, 예측=np.where(pred, pos_nm, neg_nm),
-                                                   판정=np.select([pred & (y == 1), pred & (y == 0), ~pred & (y == 1)], ["TP", "FP", "FN"], "TN"))
-        out["edge"] = out.edge.map(lambda e: EDGES[e][2])
-        st.dataframe(out.rename(columns={"metric": "지표", "study": "연구", "edge": "비교"}).sort_values("확률", ascending=False)
-                     .style.format({"확률": "{:.2f}"}), hide_index=True, width="stretch")
-    with st.expander("임계값별 전체 지표표"):
-        st.dataframe(sw.drop(columns=["Youden"]).style.format({c: "{:.2f}" for c in sw.columns if c not in ("tp", "fp", "fn", "tn")}
-                                                               | {c: "{:.0f}" for c in ("tp", "fp", "fn", "tn")}),
-                     hide_index=True, width="stretch")
-
-
 # ───────────────────────── 화면 ─────────────────────────
 st.set_page_config(page_title="제로음료 판정 모델 비교", layout="wide")
 st.title("제로음료, 몸에 좋은가? — 모델 3종 판정 비교")
@@ -735,8 +543,7 @@ if cf is not None:  # 헤드라인
         else:
             st.warning("어느 분류 모델도 다수결 기준선을 넘지 못했습니다. 주어진 특징(지표·비교·하위군·연도·SE)만으로는 연구 결과의 클래스를 신뢰성 있게 예측하기 어렵다는 뜻입니다.")
 
-tc, tt, tm, t1, t2, t3 = st.tabs(["⭐ 분류 모델 3종", "🎚️ 로지스틱 임계값 튜닝", "📎 메타분석 모델의 판정 성능",
-                                  "① 판정표 한눈에", "② 칸별 자세히", "③ 진단(이질성·일치성)"])
+tc, tt, tm, t1, t2, t3 = st.tabs(["⭐ 분류 모델 3종", "🎚️ 임계값 실험실", "📎 메타분석 모델의 판정 성능", "① 판정표 한눈에", "② 칸별 자세히", "③ 진단(이질성·일치성)"])
 
 with tc:
     if cf is None:
@@ -825,7 +632,149 @@ with tc:
                 col.metric(n, f"P({cl[0]}) = {pr[0]:.0%}", f"예측: {cl[int(np.argmax(pr))]}", delta_color="off")
 
 with tt:
-    render_threshold_tab(X)
+    st.subheader("🎚️ 임계값 실험실 — 로지스틱 회귀 (방향 과제)")
+    st.markdown(
+        "**시그모이드 곡선 위에 연구들을 올려 두고 임계값 t를 직접 옮겨 보세요.** 점이 t선 오른쪽이면 \"낮음(−)\"으로, 왼쪽이면 \"높음(+)\"으로 분류됩니다. "
+        "점의 색은 **실제 클래스**이고, ✕ 표시는 **틀리게 분류된 연구**입니다. t를 움직이면 아래 정확도 곡선의 점이 같이 움직입니다.")
+    lab_cf = run_classifiers(X, "dir") if cf is not None else None  # 위의 분류 과제 선택과 무관하게 방향 과제 사용
+    if lab_cf is None:
+        st.info("데이터가 부족해 실험실을 열 수 없습니다.")
+    else:
+        lab_pos = lab_cf["y"] == 0                                   # 실제 '낮음(−)' = 양성
+        lab_p = np.clip(lab_cf["oof"][CLF_NAMES[0]][:, 0], 1e-4, 1 - 1e-4)  # 검증 예측 P(낮음)
+        lab_z = np.log(lab_p / (1 - lab_p))                          # 점수 z = ln(p/(1−p))
+        lab_n = len(lab_p)
+        TS = np.round(np.arange(0.01, 1.0, 0.01), 2)
+        pm = lab_p[None, :] >= TS[:, None]                           # 임계값 × 연구: True=낮음으로 분류
+        TPm, FPm = (pm & lab_pos).sum(1), (pm & ~lab_pos).sum(1)
+        FNm, TNm = (~pm & lab_pos).sum(1), (~pm & ~lab_pos).sum(1)
+        acc, sens, spec = (TPm + TNm) / lab_n, TPm / (TPm + FNm), TNm / (TNm + FPm)
+        bacc = (sens + spec) / 2
+
+        def lab_best(v):  # 최고값, 최고를 내는 임계값 목록, 그중 0.5에 가장 가까운 값
+            idx = np.where(v >= v.max() - 1e-9)[0]
+            return v.max(), TS[idx], TS[idx[np.argmin(np.abs(TS[idx] - 0.5))]]
+
+        def lab_ranges(ts):  # 연속 구간 문자열
+            out, a, b = [], ts[0], ts[0]
+            for t_ in ts[1:]:
+                if round(t_ - b, 2) > 0.01:
+                    out.append((a, b))
+                    a = t_
+                b = t_
+            out.append((a, b))
+            return ", ".join(f"{x:.2f}" if x == y else f"{x:.2f}~{y:.2f}" for x, y in out)
+
+        a_max, a_ts, a_pick = lab_best(acc)
+        b_max, b_ts, b_pick = lab_best(bacc)
+
+        st.session_state.setdefault("thr", 0.5)
+        lc = st.columns([3, 1, 1, 1])
+        lc[1].button("정확도 최고 지점", on_click=lambda v=float(a_pick): st.session_state.__setitem__("thr", v))
+        lc[2].button("균형정확도 최고 지점", on_click=lambda v=float(b_pick): st.session_state.__setitem__("thr", v))
+        lc[3].button("0.5로 되돌리기", on_click=lambda: st.session_state.__setitem__("thr", 0.5))
+        t = lc[0].slider("임계값 t  (P(낮음) ≥ t 이면 '낮음'으로 분류)", 0.01, 0.99, step=0.01, key="thr")
+        lab_i = int(np.argmin(np.abs(TS - t)))
+        zt = float(np.log(t / (1 - t)))
+
+        # ── 1) 큰 시그모이드 그림
+        zz = np.linspace(-5.5, 5.5, 500)
+        fs = go.Figure()
+        fs.add_vrect(x0=zt, x1=5.5, fillcolor="#4C78A8", opacity=0.10, line_width=0)
+        fs.add_vrect(x0=-5.5, x1=zt, fillcolor="#E45756", opacity=0.10, line_width=0)
+        fs.add_trace(go.Scatter(x=zz, y=1 / (1 + np.exp(-zz)), mode="lines", line=dict(color="#333333", width=4),
+                                name="시그모이드  p = 1 / (1 + e^−z)", hoverinfo="skip"))
+        pred_now = lab_p >= t
+        ok_now = pred_now == lab_pos
+        for lab_name, mask, col in [("낮음(−) 연구", lab_pos, "#4C78A8"), ("높음(+) 연구", ~lab_pos, "#E45756")]:
+            for good, sym, size in [(True, "circle", 13), (False, "x", 16)]:
+                m_ = mask & (ok_now == good)
+                if m_.any():
+                    fs.add_trace(go.Scatter(
+                        x=lab_z[m_], y=lab_p[m_], mode="markers", name=f"{lab_name} · " + ("맞게 분류" if good else "틀리게 분류"),
+                        marker=dict(color=col, symbol=sym, size=size, line=dict(width=3 if not good else 1, color="#111111" if not good else "white"),
+                                    opacity=0.9),
+                        customdata=np.c_[X.metric[m_], X.study[m_]],
+                        hovertemplate="%{customdata[0]} · %{customdata[1]}<br>P(낮음)=%{y:.2f} (z=%{x:.2f})<extra></extra>"))
+        fs.add_hline(y=t, line_dash="dash", line_color="#2CA02C", line_width=2)
+        fs.add_vline(x=zt, line_dash="dash", line_color="#2CA02C", line_width=3)
+        fs.add_vline(x=0, line_dash="dot", line_color="gray")
+        fs.add_trace(go.Scatter(x=[zt], y=[t], mode="markers+text", text=[f"  t = {t:.2f}"], textposition="middle right",
+                                textfont=dict(size=16, color="#2CA02C"), marker=dict(color="#2CA02C", size=18, symbol="star"),
+                                name="현재 임계값", hoverinfo="skip"))
+        fs.add_annotation(x=0, y=1.0, yref="paper", text="변곡점 (z=0, p=0.5)", showarrow=False, yanchor="bottom", font=dict(color="gray"))
+        fs.add_annotation(x=5.4, y=0.06, text="← 이 쪽은 '낮음'으로 분류", showarrow=False, xanchor="right", font=dict(size=14, color="#4C78A8"))
+        fs.add_annotation(x=-5.4, y=0.94, text="이 쪽은 '높음'으로 분류 →", showarrow=False, xanchor="left", font=dict(size=14, color="#E45756"))
+        fs.update_layout(height=680, margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h", y=-0.12),
+                         xaxis=dict(title="점수 z = b₀ + b₁x₁ + … (로지스틱 회귀의 선형 점수)", range=[-5.5, 5.5]),
+                         yaxis=dict(title="P(낮음(−)) — 모델이 낮음일 확률", range=[-0.03, 1.03]))
+        st.plotly_chart(fs, width="stretch")
+        st.caption("점은 검증 예측(leave-one-paper-out)으로 얻은 연구별 확률이고, 모두 시그모이드 곡선 위에 놓입니다. 초록 점선이 임계값, 회색 점선이 변곡점(p=0.5)입니다.")
+
+        # ── 2) 현재 임계값의 성적
+        st.subheader(f"임계값 t = {t:.2f} 에서의 성적")
+        prec = TPm[lab_i] / (TPm[lab_i] + FPm[lab_i]) if (TPm[lab_i] + FPm[lab_i]) else 0.0
+        f1 = 2 * prec * sens[lab_i] / (prec + sens[lab_i]) if (prec + sens[lab_i]) else 0.0
+        mc = st.columns(6)
+        mc[0].metric("정확도", f"{acc[lab_i]:.1%}", f"{acc[lab_i] - a_max:+.1%} vs 최고", delta_color="off")
+        mc[1].metric("균형정확도", f"{bacc[lab_i]:.1%}", f"{bacc[lab_i] - b_max:+.1%} vs 최고", delta_color="off")
+        mc[2].metric("민감도(낮음 재현율)", f"{sens[lab_i]:.1%}")
+        mc[3].metric("특이도(높음 재현율)", f"{spec[lab_i]:.1%}")
+        mc[4].metric("정밀도", f"{prec:.1%}")
+        mc[5].metric("F1", f"{f1:.2f}")
+        if a_ts.min() - 1e-9 <= t <= a_ts.max() + 1e-9 and acc[lab_i] >= a_max - 1e-9:
+            st.success(f"지금 임계값은 **정확도가 가장 높은 구간**입니다 (최고 {a_max:.1%}).")
+        else:
+            st.warning(f"정확도 최고({a_max:.1%})보다 {100 * (a_max - acc[lab_i]):.1f}%p 낮습니다. 최고 지점으로 옮겨 보세요.")
+        cm1, cm2 = st.columns([1, 2])
+        with cm1:
+            fc = go.Figure(go.Heatmap(z=[[TPm[lab_i], FNm[lab_i]], [FPm[lab_i], TNm[lab_i]]], x=["낮음으로 분류", "높음으로 분류"], y=["실제 낮음", "실제 높음"],
+                                      text=[[TPm[lab_i], FNm[lab_i]], [FPm[lab_i], TNm[lab_i]]], texttemplate="%{text}", textfont=dict(size=26),
+                                      colorscale="Blues", showscale=False, xgap=3, ygap=3))
+            fc.update_yaxes(autorange="reversed")
+            fc.update_layout(height=360, margin=dict(l=10, r=10, t=30, b=10), title=dict(text="혼동행렬", font=dict(size=14)))
+            st.plotly_chart(fc, width="stretch")
+        with cm2:
+            st.markdown(f"- 낮음으로 분류된 연구: **{int(pm[lab_i].sum())}건** (실제 낮음 {int(lab_pos.sum())}건 / 높음 {int((~lab_pos).sum())}건)\n"
+                        f"- 맞게 분류: **{int(TPm[lab_i] + TNm[lab_i])}건**, 틀리게 분류: **{int(FPm[lab_i] + FNm[lab_i])}건**\n"
+                        "- t를 **낮추면** '낮음'으로 분류되는 연구가 늘어 민감도↑·특이도↓, **높이면** 반대가 됩니다.\n"
+                        "- 정확도는 두 클래스 건수 비율의 영향을 받고, 균형정확도는 두 클래스를 똑같이 반영합니다.")
+
+        # ── 3) 임계값을 쓸어 본 곡선
+        st.subheader("임계값을 0.01~0.99로 바꿔 보면: 어디가 가장 높은가")
+        fw = go.Figure()
+        for name, v, col, dash, w in [("정확도", acc, "#4C78A8", "solid", 5), ("균형정확도", bacc, "#2CA02C", "solid", 5),
+                                      ("민감도", sens, "#F58518", "dot", 2), ("특이도", spec, "#B279A2", "dot", 2)]:
+            fw.add_trace(go.Scatter(x=TS, y=v, mode="lines", name=name, line=dict(color=col, dash=dash, width=w),
+                                    hovertemplate=name + " %{y:.1%} (t=%{x:.2f})<extra></extra>"))
+            fw.add_trace(go.Scatter(x=[TS[lab_i]], y=[v[lab_i]], mode="markers", showlegend=False, hoverinfo="skip",
+                                    marker=dict(color=col, size=14, line=dict(width=2, color="white"))))
+        for name, v, col, pick in [("정확도", acc, "#4C78A8", a_pick), ("균형정확도", bacc, "#2CA02C", b_pick)]:
+            fw.add_trace(go.Scatter(x=[pick], y=[v[int(np.argmin(np.abs(TS - pick)))]], mode="markers", showlegend=False,
+                                    marker=dict(color=col, size=22, symbol="star", line=dict(width=2, color="#111111")),
+                                    hovertemplate=name + " 최고<extra></extra>"))
+        fw.add_vline(x=t, line_dash="dash", line_color="#2CA02C", line_width=3)
+        fw.add_vline(x=0.5, line_dash="dot", line_color="gray", annotation_text="0.5", annotation_position="top")
+        fw.update_layout(height=600, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", y=-0.15),
+                         xaxis=dict(title="임계값 t", range=[0, 1]), yaxis=dict(title="점수", tickformat=".0%", range=[0, 1.02]))
+        st.plotly_chart(fw, width="stretch")
+        st.info(f"⭐ **정확도 최고 {a_max:.1%}** → 임계값 {lab_ranges(a_ts)}  |  **균형정확도 최고 {b_max:.1%}** → 임계값 {lab_ranges(b_ts)}\n\n"
+                "최고 점수가 한 점이 아니라 **구간**으로 나오는 것은, 연구가 79건뿐이라 임계값을 조금 움직여도 분류가 바뀌는 연구가 없기 때문입니다. "
+                "0.5에서 크게 벗어나면(0.3 이하, 0.7 이상) 점수가 뚜렷이 떨어지는지 확인해 보세요.")
+
+        # ── 4) 임계값 근처에서 판정이 바뀌는 연구
+        st.subheader("임계값을 움직이면 판정이 바뀌는 연구")
+        lab_df = pd.DataFrame({"지표": X.metric.values, "연구": X.study.values, "P(낮음)": lab_p,
+                               "실제": np.where(lab_pos, DIRS[0], DIRS[1]), "예측": np.where(pred_now, DIRS[0], DIRS[1])})
+        lab_df["맞음"] = np.where(lab_df["실제"] == lab_df["예측"], "✅", "❌")
+        near = lab_df[(lab_df["P(낮음)"] - t).abs() <= 0.05].sort_values("P(낮음)")
+        st.caption(f"현재 t={t:.2f} ±0.05 안에 있는 연구 {len(near)}건입니다. t를 조금만 옮겨도 이 연구들의 분류가 바뀝니다.")
+        st.dataframe(near.assign(**{"P(낮음)": near["P(낮음)"].map("{:.3f}".format)}), hide_index=True, width="stretch")
+        with st.expander("임계값별 전체 점수 표 (0.05 간격)"):
+            sel = np.isin(np.round(TS * 100).astype(int), np.arange(5, 100, 5))
+            st.dataframe(pd.DataFrame({"t": TS[sel], "정확도": acc[sel], "균형정확도": bacc[sel], "민감도": sens[sel], "특이도": spec[sel],
+                                       "낮음 분류 건수": pm.sum(1)[sel]}).style.format(
+                {"t": "{:.2f}", "정확도": "{:.1%}", "균형정확도": "{:.1%}", "민감도": "{:.1%}", "특이도": "{:.1%}"}), hide_index=True, width="stretch")
 
 with tm:
     st.subheader("메타분석 모델은 연구 결과를 얼마나 잘 분류하나")
